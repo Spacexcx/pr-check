@@ -71,7 +71,9 @@ or, when something needs a second look:
 
 This has been tested against a small batch of real merged Godot PRs, not a large benchmark — treat it as an early-stage tool, not a proven one.
 
-- **Evidence quotes are verified, reasoning is not.** The tool checks that every quoted line genuinely comes from the diff (not fabricated, not pulled from unchanged context) — but it can't yet verify that the *reasoning* built on a real quote is technically correct. In one test, it correctly quoted a real line but incorrectly concluded it caused a deadlock, because it assumed a non-recursive mutex where the actual type was recursive. A true quote does not guarantee a true conclusion.
+- **Evidence quotes are verified, reasoning is not fully.** The tool checks that every quoted line genuinely comes from the diff (not fabricated, not pulled from unchanged context) — but a true quote doesn't guarantee a true conclusion. In one test, it correctly quoted a real line but incorrectly concluded it caused a deadlock, because it assumed a non-recursive mutex where the actual type was recursive.
+
+  A second pass now targets exactly this gap: for every file still flagged after evidence verification, the model is asked to inspect its own reasoning for unverified assumptions about type/library/framework behavior. Re-run against the deadlock case above, it correctly surfaced: `⚠ Assumes: the Mutex type used here is non-recursive — verify before trusting this flag`. This doesn't reject the flag automatically — it can't confirm the assumption is *wrong*, only that it's *unverified* — so it surfaces the assumption instead of silently trusting or silently discarding it.
 - It's currently better at catching structural/concurrency risk than logic-vs-intent mismatches (code that contradicts its own docstring), though sending full file content alongside the diff (rather than just the diff hunk) has measurably helped with this.
 - No packaging yet — this is a single script, not a pip-installable package.
 
@@ -80,4 +82,5 @@ This has been tested against a small batch of real merged Godot PRs, not a large
 1. Gathers the diff plus the full current content of each changed file (a diff hunk alone can't show a docstring several lines above the change that the edit now contradicts).
 2. Sends it to Gemini with a system prompt tuned against real merged PRs, including explicit rules against common false-positive patterns (keyword-triggered security flags, business-logic bias over config/wiring changes).
 3. For every flag, verifies in code (not by trusting the model's self-report) that the quoted evidence is an actual added/removed line in the diff.
-4. Prints only what's worth your attention — clean files are summarized, not narrated.
+4. For flags that survive that check, asks the model a second, adversarial question: what unverified assumption about type/library/framework behavior does this reasoning depend on? Surfaces the answer as a warning rather than silently trusting or discarding the flag.
+5. Prints only what's worth your attention — clean files are summarized, not narrated.

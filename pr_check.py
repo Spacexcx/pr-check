@@ -54,6 +54,18 @@ Respond ONLY with valid JSON, no markdown fences, no other text:
 {"files":[{"filename":"...","risky":true,"confidence":"low|medium|high","reason":"one sentence","evidence_quote":"exact substring from the diff, or empty string if not risky"}],"summary":"one sentence overview of the change"}
 """
 
+CRITIQUE_SYSTEM_PROMPT = """You will be shown a list of risk claims made about a code change, each with the exact diff line quoted as evidence. Your job is NOT to re-judge whether the risk is real — it is to find unverified assumptions the claim's REASONING depends on.
+
+A claim can quote a completely real line and still be wrong, if it silently assumes something about how a type, library, or framework behaves that isn't shown in the visible code. Common categories: whether a lock/mutex type is recursive or reentrant; whether a function is thread-safe, atomic, or idempotent by contract; whether a callback runs synchronously or is deferred; whether a default value/initializer has the effect assumed; whether an inherited/overridden method preserves the base behavior described.
+
+For each claim, ask: "Does this reasoning depend on a specific behavioral property of a type/library/framework that is NOT directly visible in the diff or file content I was given?" If yes, state that exact property as a short, checkable assumption (e.g. "assumes the Mutex type used here is non-recursive"). If the reasoning is fully self-contained in the visible code with no outside assumption, return an empty string for that file.
+
+Do not soften or second-guess claims that don't rely on an outside assumption — only surface genuine unverified dependencies.
+
+Respond ONLY with valid JSON, no markdown fences, no other text:
+{"critiques":[{"filename":"...","unverified_assumption":"short specific assumption, or empty string if none"}]}
+"""
+
 
 def fetch_github_pr(pr_url):
     """
@@ -215,13 +227,18 @@ def build_context(diff_text, staged_only=False):
     return "\n".join(parts)
 
 
-def analyze(context_text, api_key):
+def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000):
+    """
+    Shared low-level call: sends `text` to Gemini under `system_prompt`,
+    forced into JSON-only output, and returns the parsed JSON dict.
+    Used both for the main risk analysis and the later critique pass.
+    """
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
     payload = {
-        "contents": [{"parts": [{"text": context_text}]}],
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": text}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {
-            "maxOutputTokens": 6000,
+            "maxOutputTokens": max_output_tokens,
             "response_mime_type": "application/json",
         }
     }
@@ -256,6 +273,33 @@ def analyze(context_text, api_key):
         sys.exit(1)
 
 
+def analyze(context_text, api_key):
+    return _call_gemini(context_text, SYSTEM_PROMPT, api_key, max_output_tokens=6000)
+
+
+def critique_reasoning(risky_files, api_key):
+    """
+    Second pass, run only on files still flagged risky after evidence
+    verification. Asks the model to adversarially inspect its OWN prior
+    claims for unverified assumptions about type/library/framework
+    behavior — the exact gap a true-but-misleading evidence_quote can't
+    close on its own (e.g. assuming a mutex is non-recursive without
+    being able to see its declaration). Returns filename -> assumption
+    text (empty string if none found).
+    """
+    if not risky_files:
+        return {}
+    claims_text = "\n".join(
+        f"- {f['filename']}: {f.get('reason', '')} (quoted: \"{f.get('evidence_quote', '')}\")"
+        for f in risky_files
+    )
+    result = _call_gemini(claims_text, CRITIQUE_SYSTEM_PROMPT, api_key, max_output_tokens=2000)
+    return {
+        c.get("filename", ""): (c.get("unverified_assumption") or "").strip()
+        for c in result.get("critiques", [])
+    }
+
+
 def print_results(result):
     print()
     print(f"{BOLD}{result.get('summary', '')}{RESET}")
@@ -272,6 +316,8 @@ def print_results(result):
         print(f"   {f.get('reason', '')}")
         if f.get("evidence_quote"):
             print(f"   {DIM}\u21b3 \"{f['evidence_quote']}\"{RESET}")
+        if f.get("unverified_assumption"):
+            print(f"   {YELLOW}\u26a0 Assumes: {f['unverified_assumption']} — verify before trusting this flag{RESET}")
         print()
 
     if safe:
@@ -311,6 +357,16 @@ def main():
     print(f"{DIM}Analyzing changes — sending to Gemini...{RESET}")
     result = analyze(context_text, api_key)
     result["files"] = verify_evidence(result.get("files", []), diff_text, extra_valid_text=pr_description)
+
+    still_risky = [f for f in result["files"] if f.get("risky")]
+    if still_risky:
+        print(f"{DIM}Checking flagged files for unverified assumptions...{RESET}")
+        assumptions = critique_reasoning(still_risky, api_key)
+        for f in result["files"]:
+            assumption = assumptions.get(f["filename"], "")
+            if assumption:
+                f["unverified_assumption"] = assumption
+
     print_results(result)
 
 
