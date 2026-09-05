@@ -38,6 +38,12 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
+# Total budget (characters) for "extra" full-file content sent alongside the
+# diff. The diff itself is never capped — this only limits the nice-to-have
+# full-file context, so a PR touching many files degrades gracefully to
+# diff-only for the overflow instead of growing the request unbounded.
+MAX_FULL_FILE_CONTEXT_CHARS = 300_000
+
 SYSTEM_PROMPT = """You are a senior code reviewer's assistant. You will be given a git diff AND the full current content of each changed file (when available). Use the full file content to check whether the changed lines contradict a docstring, comment, or naming convention defined elsewhere in the file — the diff hunk alone often can't show this, so actively look above/below the changed lines in the full file content for that kind of contradiction. Identify which changed files carry real risk that a human should double-check before committing/pushing.
 
 LEARNED PATTERN: both human reviewers and naive LLM analysis have a systematic bias toward flagging visible business-logic files while UNDER-WEIGHTING config/wiring/initializer files (auth middleware, dependency injection, routing, environment setup) — even though real incidents disproportionately show up in those wiring files. When you see both business-logic and config/wiring changes, give genuine scrutiny to what the config change actually does at runtime rather than defaulting to flagging the more readable business logic.
@@ -106,10 +112,23 @@ def fetch_github_pr(pr_url):
 
     parts = [f"=== PR TITLE ===\n{pr_data.get('title','')}\n\n=== PR DESCRIPTION ===\n{(pr_data.get('body') or '')[:1500]}"]
     diff_chunks = []
+    full_file_chars_used = 0
+    files_truncated = 0
     for f in files_data:
         fname = f["filename"]
         patch = f.get("patch", "(binary or too large to diff)")
         diff_chunks.append(f"--- a/{fname}\n+++ b/{fname}\n{patch}")
+
+        # The diff itself is always kept for every file, no matter how many
+        # files the PR touches — only the extra full-file content (nice to
+        # have, not essential) is capped by a total budget. Once a PR has
+        # enough changed files to blow past MAX_FULL_FILE_CONTEXT_CHARS,
+        # remaining files fall back to diff-only instead of growing the
+        # request unbounded (which risks a degraded or truncated response
+        # the same way a too-small maxOutputTokens did earlier).
+        if full_file_chars_used >= MAX_FULL_FILE_CONTEXT_CHARS:
+            files_truncated += 1
+            continue
 
         if f.get("status") != "removed" and f.get("changes", 0) < 2000:
             raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{head_sha}/{fname}"
@@ -117,10 +136,18 @@ def fetch_github_pr(pr_url):
                 req = urllib.request.Request(raw_url)
                 with urllib.request.urlopen(req) as resp:
                     content = resp.read().decode("utf-8", errors="ignore")
-                if len(content) < 40_000:
+                if len(content) >= 40_000:
+                    pass  # too large for a single file regardless of remaining budget
+                elif full_file_chars_used + len(content) <= MAX_FULL_FILE_CONTEXT_CHARS:
                     parts.append(f"\n=== FULL FILE (current state): {fname} ===\n{content}")
+                    full_file_chars_used += len(content)
+                else:
+                    files_truncated += 1  # would fit alone, but budget is nearly full
             except Exception:
                 pass  # fall back to diff-only for this file
+
+    if files_truncated:
+        print(f"{YELLOW}Large PR: sent full file content for the first files within budget, diff-only for the remaining {files_truncated} file(s).{RESET}")
 
     diff_only_text = "\n\n".join(diff_chunks)
     description_text = f"{pr_data.get('title','')}\n{(pr_data.get('body') or '')}"
@@ -210,6 +237,8 @@ def build_context(diff_text, staged_only=False):
     filenames = get_changed_filenames(staged_only=staged_only)
     parts = [f"=== DIFF (what changed) ===\n{diff_text}"]
 
+    full_file_chars_used = 0
+    files_truncated = 0
     for fname in filenames:
         try:
             size = os.path.getsize(fname)
@@ -217,12 +246,19 @@ def build_context(diff_text, staged_only=False):
             continue  # deleted file, or path issue — diff alone still covers it
         if size > 40_000:  # skip huge files, diff context is enough for those
             continue
+        if full_file_chars_used + size > MAX_FULL_FILE_CONTEXT_CHARS:
+            files_truncated += 1
+            continue  # diff already covers this file; just skip the extra full-file context
         try:
             with open(fname, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
         except OSError:
             continue
         parts.append(f"\n=== FULL FILE (current state): {fname} ===\n{content}")
+        full_file_chars_used += len(content)
+
+    if files_truncated:
+        print(f"{YELLOW}Large changeset: sent full file content for the first files within budget, diff-only for the remaining {files_truncated} file(s).{RESET}")
 
     return "\n".join(parts)
 
