@@ -27,6 +27,7 @@ import sys
 import json
 import subprocess
 import argparse
+import time
 import urllib.request
 import urllib.error
 
@@ -263,7 +264,7 @@ def build_context(diff_text, staged_only=False):
     return "\n".join(parts)
 
 
-def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000):
+def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retries=3):
     """
     Shared low-level call: sends `text` to Gemini under `system_prompt`,
     forced into JSON-only output, and returns the parsed JSON dict.
@@ -284,12 +285,31 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000):
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        print(f"{RED}Gemini API error ({e.code}): {body}{RESET}")
+
+    # Transient errors (server overload, rate limit) are worth retrying —
+    # they're about Gemini's load at that moment, not about the request
+    # being wrong, and often clear up within seconds. Permanent errors
+    # (bad API key, malformed request, etc.) are not retried, since trying
+    # again won't change the outcome.
+    TRANSIENT_CODES = {429, 500, 502, 503, 504}
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8")
+            last_error = (e.code, body)
+            if e.code not in TRANSIENT_CODES or attempt == max_retries:
+                print(f"{RED}Gemini API error ({e.code}): {body}{RESET}")
+                sys.exit(1)
+            wait = 2 ** attempt  # 1s, 2s, 4s
+            print(f"{YELLOW}Gemini API busy ({e.code}), retrying in {wait}s... (attempt {attempt + 1}/{max_retries}){RESET}")
+            time.sleep(wait)
+    else:
+        code, body = last_error
+        print(f"{RED}Gemini API error ({code}) after {max_retries} retries: {body}{RESET}")
         sys.exit(1)
 
     # Gemini can split its answer across multiple `parts` (and, for
