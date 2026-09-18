@@ -7,19 +7,8 @@ content of each changed file (for context the diff alone can't show,
 like docstrings above the changed lines), sends it to Gemini for risk
 analysis, prints results to your terminal.
 
-Never touches GitHub or your PR. That said, be clear-eyed about this:
-the diff and file contents DO leave your machine over the network to
-reach Gemini's API. This is not air-gapped. Check Google's current
-data retention policy for the free tier before pointing this at
-anything sensitive.
-
-Setup (free, no credit card):
-    1. Go to aistudio.google.com -> "Get API key" -> Create API key
-    2. export GEMINI_API_KEY="AIza..."
-
-Usage:
-    python3 pr_check.py            # analyzes unstaged + staged changes
-    python3 pr_check.py --staged   # only staged changes
+Never touches GitHub or your PR. Check Google's current data retention
+policy for the free tier before pointing this at anything sensitive.
 """
 
 import os
@@ -30,6 +19,11 @@ import argparse
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
+
+# Enable VT100 / ANSI escape sequences in Windows console without external packages
+if sys.platform == "win32":
+    os.system("")
 
 # ANSI colors for terminal output
 RED = "\033[91m"
@@ -39,11 +33,8 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
-# Total budget (characters) for "extra" full-file content sent alongside the
-# diff. The diff itself is never capped — this only limits the nice-to-have
-# full-file context, so a PR touching many files degrades gracefully to
-# diff-only for the overflow instead of growing the request unbounded.
 MAX_FULL_FILE_CONTEXT_CHARS = 300_000
+KEY_FILE = Path.home() / ".pr_check_key"
 
 SYSTEM_PROMPT = """You are a senior code reviewer's assistant. You will be given a git diff AND the full current content of each changed file (when available). Use the full file content to check whether the changed lines contradict a docstring, comment, or naming convention defined elsewhere in the file — the diff hunk alone often can't show this, so actively look above/below the changed lines in the full file content for that kind of contradiction. Identify which changed files carry real risk that a human should double-check before committing/pushing.
 
@@ -74,11 +65,47 @@ Respond ONLY with valid JSON, no markdown fences, no other text:
 """
 
 
+def get_api_key(cli_key=None):
+    """Retrieves the API key from argument, environment, stored config, or prompts the user interactively."""
+    if cli_key:
+        return cli_key.strip()
+    
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key:
+        return env_key.strip()
+
+    if KEY_FILE.exists():
+        try:
+            stored = KEY_FILE.read_text(encoding="utf-8").strip()
+            if stored:
+                return stored
+        except Exception:
+            pass
+
+    # Interactive fallback
+    print(f"{YELLOW}GEMINI_API_KEY is not set.{RESET}")
+    print(f"Get a free key (no credit card needed) at {BOLD}https://aistudio.google.com{RESET}")
+    try:
+        entered = input("Paste your Gemini API Key here (press Enter to cancel): ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(1)
+
+    if not entered:
+        print(f"{RED}No API key provided. Exiting.{RESET}")
+        sys.exit(1)
+
+    # Offer to save locally for convenience
+    try:
+        KEY_FILE.write_text(entered, encoding="utf-8")
+        print(f"{GREEN}Saved key to {KEY_FILE} for future runs.{RESET}\n")
+    except Exception:
+        pass
+
+    return entered
+
+
 def fetch_github_pr(pr_url):
-    """
-    Fetches diff + full file contents directly from a GitHub PR URL,
-    no local git repo needed. Public repos only (no auth).
-    """
     import re
     m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_url)
     if not m:
@@ -87,9 +114,13 @@ def fetch_github_pr(pr_url):
     owner, repo, num = m.groups()
 
     api_base = f"https://api.github.com/repos/{owner}/{repo}"
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "pr-check-cli"
+    }
 
     def gh_get(url):
-        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.v3+json"})
+        req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req) as resp:
                 return json.loads(resp.read().decode("utf-8"))
@@ -120,13 +151,6 @@ def fetch_github_pr(pr_url):
         patch = f.get("patch", "(binary or too large to diff)")
         diff_chunks.append(f"--- a/{fname}\n+++ b/{fname}\n{patch}")
 
-        # The diff itself is always kept for every file, no matter how many
-        # files the PR touches — only the extra full-file content (nice to
-        # have, not essential) is capped by a total budget. Once a PR has
-        # enough changed files to blow past MAX_FULL_FILE_CONTEXT_CHARS,
-        # remaining files fall back to diff-only instead of growing the
-        # request unbounded (which risks a degraded or truncated response
-        # the same way a too-small maxOutputTokens did earlier).
         if full_file_chars_used >= MAX_FULL_FILE_CONTEXT_CHARS:
             files_truncated += 1
             continue
@@ -134,18 +158,18 @@ def fetch_github_pr(pr_url):
         if f.get("status") != "removed" and f.get("changes", 0) < 2000:
             raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{head_sha}/{fname}"
             try:
-                req = urllib.request.Request(raw_url)
+                req = urllib.request.Request(raw_url, headers={"User-Agent": "pr-check-cli"})
                 with urllib.request.urlopen(req) as resp:
                     content = resp.read().decode("utf-8", errors="ignore")
                 if len(content) >= 40_000:
-                    pass  # too large for a single file regardless of remaining budget
+                    pass
                 elif full_file_chars_used + len(content) <= MAX_FULL_FILE_CONTEXT_CHARS:
                     parts.append(f"\n=== FULL FILE (current state): {fname} ===\n{content}")
                     full_file_chars_used += len(content)
                 else:
-                    files_truncated += 1  # would fit alone, but budget is nearly full
+                    files_truncated += 1
             except Exception:
-                pass  # fall back to diff-only for this file
+                pass
 
     if files_truncated:
         print(f"{YELLOW}Large PR: sent full file content for the first files within budget, diff-only for the remaining {files_truncated} file(s).{RESET}")
@@ -157,34 +181,16 @@ def fetch_github_pr(pr_url):
 
 
 def extract_changed_lines(diff_text):
-    """
-    Returns the set of actual added/removed line contents from a unified
-    diff, stripped of the leading +/- marker and surrounding whitespace.
-    Used to verify the model's evidence_quote actually comes from a
-    changed line, not from unchanged context lines it was also shown.
-    """
     changed = []
     for line in diff_text.splitlines():
         if line.startswith("+++") or line.startswith("---"):
-            continue  # file header lines, not real content
+            continue
         if line.startswith("+") or line.startswith("-"):
             changed.append(line[1:].strip())
     return changed
 
 
 def verify_evidence(files, diff_text, extra_valid_text=""):
-    """
-    Code-level check (not trusting the model's own claim): for each file
-    flagged as risky, confirm its evidence_quote text actually appears
-    in an added/removed line of the diff, OR in extra_valid_text (e.g.
-    the PR title/description — legitimate for the concurrency-exception
-    rule, which allows quoting the author's own uncertainty). If it only
-    matches unchanged diff context (or nothing), the model likely
-    fabricated a plausible-sounding justification — demote the flag.
-    """
-    # Normalize each changed line SEPARATELY (don't join them into one blob —
-    # that would let a quote spanning the boundary of two unrelated lines
-    # pass verification even though no single line actually contains it).
     normalized_lines = [" ".join(line.split()) for line in extract_changed_lines(diff_text)]
     normalized_extra = " ".join(extra_valid_text.split())
 
@@ -205,10 +211,6 @@ def verify_evidence(files, diff_text, extra_valid_text=""):
 
 
 def get_git_diff(staged_only=False):
-    """
-    Returns the raw unified diff text for staged or unstaged+staged
-    local changes, via `git diff`.
-    """
     cmd = ["git", "diff", "--cached"] if staged_only else ["git", "diff", "HEAD"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -228,13 +230,6 @@ def get_changed_filenames(staged_only=False):
 
 
 def build_context(diff_text, staged_only=False):
-    """
-    Combines the diff (shows exactly what changed) with the full current
-    content of each changed file (gives the model context a hunk-limited
-    diff can't show — e.g. a docstring/comment above the changed lines
-    that the change now contradicts). Skips files that no longer exist
-    (deleted) or are too large to be worth the tokens.
-    """
     filenames = get_changed_filenames(staged_only=staged_only)
     parts = [f"=== DIFF (what changed) ===\n{diff_text}"]
 
@@ -244,12 +239,12 @@ def build_context(diff_text, staged_only=False):
         try:
             size = os.path.getsize(fname)
         except OSError:
-            continue  # deleted file, or path issue — diff alone still covers it
-        if size > 40_000:  # skip huge files, diff context is enough for those
+            continue
+        if size > 40_000:
             continue
         if full_file_chars_used + size > MAX_FULL_FILE_CONTEXT_CHARS:
             files_truncated += 1
-            continue  # diff already covers this file; just skip the extra full-file context
+            continue
         try:
             with open(fname, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
@@ -265,11 +260,6 @@ def build_context(diff_text, staged_only=False):
 
 
 def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retries=3):
-    """
-    Shared low-level call: sends `text` to Gemini under `system_prompt`,
-    forced into JSON-only output, and returns the parsed JSON dict.
-    Used both for the main risk analysis and the later critique pass.
-    """
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": text}]}],
@@ -286,11 +276,6 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
         method="POST"
     )
 
-    # Transient errors (server overload, rate limit) are worth retrying —
-    # they're about Gemini's load at that moment, not about the request
-    # being wrong, and often clear up within seconds. Permanent errors
-    # (bad API key, malformed request, etc.) are not retried, since trying
-    # again won't change the outcome.
     TRANSIENT_CODES = {429, 500, 502, 503, 504}
     last_error = None
     for attempt in range(max_retries + 1):
@@ -304,7 +289,7 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
             if e.code not in TRANSIENT_CODES or attempt == max_retries:
                 print(f"{RED}Gemini API error ({e.code}): {body}{RESET}")
                 sys.exit(1)
-            wait = 2 ** attempt  # 1s, 2s, 4s
+            wait = 2 ** attempt
             print(f"{YELLOW}Gemini API busy ({e.code}), retrying in {wait}s... (attempt {attempt + 1}/{max_retries}){RESET}")
             time.sleep(wait)
     else:
@@ -312,11 +297,6 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
         print(f"{RED}Gemini API error ({code}) after {max_retries} retries: {body}{RESET}")
         sys.exit(1)
 
-    # Gemini can split its answer across multiple `parts` (and, for
-    # thinking-capable models, may also include separate "thought" parts
-    # before the real answer). Taking only parts[0]["text"] silently
-    # truncates the JSON mid-string in that case — concatenate every
-    # non-thought text part instead.
     response_parts = data["candidates"][0]["content"].get("parts", [])
     raw = "".join(p.get("text", "") for p in response_parts if not p.get("thought"))
     raw = raw.replace("```json", "").replace("```", "").strip()
@@ -334,15 +314,6 @@ def analyze(context_text, api_key):
 
 
 def critique_reasoning(risky_files, api_key):
-    """
-    Second pass, run only on files still flagged risky after evidence
-    verification. Asks the model to adversarially inspect its OWN prior
-    claims for unverified assumptions about type/library/framework
-    behavior — the exact gap a true-but-misleading evidence_quote can't
-    close on its own (e.g. assuming a mutex is non-recursive without
-    being able to see its declaration). Returns filename -> assumption
-    text (empty string if none found).
-    """
     if not risky_files:
         return {}
     claims_text = "\n".join(
@@ -390,14 +361,10 @@ def main():
     parser = argparse.ArgumentParser(description="Local, private PR risk check.")
     parser.add_argument("--staged", action="store_true", help="Only analyze staged changes")
     parser.add_argument("--pr", type=str, default=None, help="GitHub PR URL to analyze instead of local git diff")
+    parser.add_argument("--key", type=str, default=None, help="Gemini API Key (optional, can also be prompted or use GEMINI_API_KEY env)")
     args = parser.parse_args()
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print(f"{RED}GEMINI_API_KEY not set.{RESET}")
-        print(f"Get a free key (no credit card needed) at aistudio.google.com, then:")
-        print(f"  export GEMINI_API_KEY='AIza...'")
-        sys.exit(1)
+    api_key = get_api_key(args.key)
 
     pr_description = ""
     if args.pr:
