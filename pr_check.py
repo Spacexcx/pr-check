@@ -35,6 +35,7 @@ RESET = "\033[0m"
 
 MAX_FULL_FILE_CONTEXT_CHARS = 300_000
 KEY_FILE = Path.home() / ".pr_check_key"
+MODEL_NAME = "gemini-3.6-flash"
 
 SYSTEM_PROMPT = """You are a senior code reviewer's assistant. You will be given a git diff AND the full current content of each changed file (when available). Use the full file content to check whether the changed lines contradict a docstring, comment, or naming convention defined elsewhere in the file — the diff hunk alone often can't show this, so actively look above/below the changed lines in the full file content for that kind of contradiction. Identify which changed files carry real risk that a human should double-check before committing/pushing.
 
@@ -66,7 +67,6 @@ Respond ONLY with valid JSON, no markdown fences, no other text:
 
 
 def get_api_key(cli_key=None):
-    """Retrieves the API key from argument, environment, stored config, or prompts the user interactively."""
     if cli_key:
         return cli_key.strip()
     
@@ -82,7 +82,6 @@ def get_api_key(cli_key=None):
         except Exception:
             pass
 
-    # Interactive fallback
     print(f"{YELLOW}GEMINI_API_KEY is not set.{RESET}")
     print(f"Get a free key (no credit card needed) at {BOLD}https://aistudio.google.com{RESET}")
     try:
@@ -95,7 +94,6 @@ def get_api_key(cli_key=None):
         print(f"{RED}No API key provided. Exiting.{RESET}")
         sys.exit(1)
 
-    # Offer to save locally for convenience
     try:
         KEY_FILE.write_text(entered, encoding="utf-8")
         print(f"{GREEN}Saved key to {KEY_FILE} for future runs.{RESET}\n")
@@ -103,6 +101,14 @@ def get_api_key(cli_key=None):
         pass
 
     return entered
+
+
+def is_git_repo():
+    try:
+        res = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
+        return res.returncode == 0
+    except Exception:
+        return False
 
 
 def fetch_github_pr(pr_url):
@@ -216,10 +222,10 @@ def get_git_diff(staged_only=False):
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return result.stdout
     except subprocess.CalledProcessError:
-        print(f"{RED}Not a git repository, or git error.{RESET}")
+        print(f"{RED}Git error occurred while reading diff.{RESET}")
         sys.exit(1)
     except FileNotFoundError:
-        print(f"{RED}git not found. Is it installed?{RESET}")
+        print(f"{RED}git executable not found. Make sure git is installed and in PATH.{RESET}")
         sys.exit(1)
 
 
@@ -259,8 +265,8 @@ def build_context(diff_text, staged_only=False):
     return "\n".join(parts)
 
 
-def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retries=3):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
+def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retries=5):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": text}]}],
         "systemInstruction": {"parts": [{"text": system_prompt}]},
@@ -277,7 +283,10 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
     )
 
     TRANSIENT_CODES = {429, 500, 502, 503, 504}
+    # Exponential-ish backoff: 2s, 4s, 8s, 12s, 16s (~42 seconds total window)
+    BACKOFF_STEPS = [2, 4, 8, 12, 16]
     last_error = None
+
     for attempt in range(max_retries + 1):
         try:
             with urllib.request.urlopen(req) as resp:
@@ -289,8 +298,8 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
             if e.code not in TRANSIENT_CODES or attempt == max_retries:
                 print(f"{RED}Gemini API error ({e.code}): {body}{RESET}")
                 sys.exit(1)
-            wait = 2 ** attempt
-            print(f"{YELLOW}Gemini API busy ({e.code}), retrying in {wait}s... (attempt {attempt + 1}/{max_retries}){RESET}")
+            wait = BACKOFF_STEPS[attempt] if attempt < len(BACKOFF_STEPS) else 15
+            print(f"{YELLOW}{MODEL_NAME} capacity busy ({e.code}), waiting {wait}s for spike to clear... (attempt {attempt + 1}/{max_retries}){RESET}")
             time.sleep(wait)
     else:
         code, body = last_error
@@ -366,6 +375,19 @@ def main():
 
     api_key = get_api_key(args.key)
 
+    # If no PR is given and not inside a git repo, prompt the user instead of crashing
+    if not args.pr and not is_git_repo():
+        print(f"{YELLOW}No active git repository detected in this directory.{RESET}")
+        try:
+            entered_pr = input("Enter a GitHub PR URL to analyze (or press Enter to exit): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(0)
+        if entered_pr:
+            args.pr = entered_pr
+        else:
+            sys.exit(0)
+
     pr_description = ""
     if args.pr:
         print(f"{DIM}Fetching {args.pr} from GitHub...{RESET}")
@@ -377,7 +399,7 @@ def main():
             sys.exit(0)
         context_text = build_context(diff_text, staged_only=args.staged)
 
-    print(f"{DIM}Analyzing changes — sending to Gemini...{RESET}")
+    print(f"{DIM}Analyzing changes — sending to {MODEL_NAME}...{RESET}")
     result = analyze(context_text, api_key)
     result["files"] = verify_evidence(result.get("files", []), diff_text, extra_valid_text=pr_description)
 
