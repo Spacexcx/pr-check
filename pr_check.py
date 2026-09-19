@@ -11,6 +11,8 @@ Never touches GitHub or your PR. Check Google's current data retention
 policy for the free tier before pointing this at anything sensitive.
 """
 
+# dogfooding test
+
 import os
 import sys
 import json
