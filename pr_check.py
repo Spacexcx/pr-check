@@ -11,8 +11,6 @@ Never touches GitHub or your PR. Check Google's current data retention
 policy for the free tier before pointing this at anything sensitive.
 """
 
-# dogfooding test
-
 import os
 import sys
 import json
@@ -111,6 +109,60 @@ def is_git_repo():
         return res.returncode == 0
     except Exception:
         return False
+
+
+def get_git_root():
+    try:
+        res = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True)
+        return Path(res.stdout.strip())
+    except Exception:
+        return None
+
+
+def install_git_hook():
+    root = get_git_root()
+    if not root:
+        print(f"{RED}Error: Not inside a git repository. Cannot install hook.{RESET}")
+        sys.exit(1)
+
+    hooks_dir = root / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook_file = hooks_dir / "pre-push"
+
+    # Detect current executable or script path
+    if getattr(sys, "frozen", False):
+        exec_target = f'"{Path(sys.executable).resolve()}"'
+    else:
+        exec_target = f'"{sys.executable}" "{Path(__file__).resolve()}"'
+
+    hook_script = f"""#!/bin/sh
+# pr-check automated pre-push gate
+echo ""
+echo "[pr-check] Running local pre-push risk analysis..."
+{exec_target}
+STATUS=$?
+
+if [ $STATUS -ne 0 ]; then
+    echo ""
+    echo "[pr-check] \033[91mPush aborted due to flagged risks.\033[0m"
+    echo "[pr-check] Double check above, or bypass with: git push --no-verify"
+    echo ""
+    exit 1
+fi
+exit 0
+"""
+    try:
+        hook_file.write_text(hook_script, encoding="utf-8", newline="\n")
+        # Ensure executable permissions on Unix/macOS/Git Bash
+        if sys.platform != "win32":
+            hook_file.chmod(0o755)
+        print(f"{GREEN}{BOLD}✓ Successfully installed pr-check pre-push hook!{RESET}")
+        print(f"{DIM}Installed to: {hook_file}{RESET}")
+        print(f"From now on, {BOLD}'git push'{RESET} will automatically verify changes before sending.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"{RED}Failed to install hook: {e}{RESET}")
+        sys.exit(1)
 
 
 def fetch_github_pr(pr_url):
@@ -267,7 +319,7 @@ def build_context(diff_text, staged_only=False):
     return "\n".join(parts)
 
 
-def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retries=5):
+def _call_gemini(text, system_prompt, api_key, max_output_tokens=8192, max_retries=5):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": text}]}],
@@ -285,7 +337,6 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
     )
 
     TRANSIENT_CODES = {429, 500, 502, 503, 504}
-    # Exponential-ish backoff: 2s, 4s, 8s, 12s, 16s (~42 seconds total window)
     BACKOFF_STEPS = [2, 4, 8, 12, 16]
     last_error = None
 
@@ -294,14 +345,15 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
             with urllib.request.urlopen(req) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             break
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8")
-            last_error = (e.code, body)
-            if e.code not in TRANSIENT_CODES or attempt == max_retries:
-                print(f"{RED}Gemini API error ({e.code}): {body}{RESET}")
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            code = getattr(e, "code", 503)
+            body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+            last_error = (code, body)
+            if code not in TRANSIENT_CODES or attempt == max_retries:
+                print(f"{RED}Gemini API error ({code}): {body}{RESET}")
                 sys.exit(1)
             wait = BACKOFF_STEPS[attempt] if attempt < len(BACKOFF_STEPS) else 15
-            print(f"{YELLOW}{MODEL_NAME} capacity busy ({e.code}), waiting {wait}s for spike to clear... (attempt {attempt + 1}/{max_retries}){RESET}")
+            print(f"{YELLOW}{MODEL_NAME} capacity busy ({code}), waiting {wait}s for spike to clear... (attempt {attempt + 1}/{max_retries}){RESET}")
             time.sleep(wait)
     else:
         code, body = last_error
@@ -311,6 +363,16 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
     response_parts = data["candidates"][0]["content"].get("parts", [])
     raw = "".join(p.get("text", "") for p in response_parts if not p.get("thought"))
     raw = raw.replace("```json", "").replace("```", "").strip()
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        json_candidate = raw[start:end + 1]
+        try:
+            return json.loads(json_candidate)
+        except json.JSONDecodeError:
+            pass
+
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
@@ -321,7 +383,7 @@ def _call_gemini(text, system_prompt, api_key, max_output_tokens=6000, max_retri
 
 
 def analyze(context_text, api_key):
-    return _call_gemini(context_text, SYSTEM_PROMPT, api_key, max_output_tokens=6000)
+    return _call_gemini(context_text, SYSTEM_PROMPT, api_key, max_output_tokens=8192)
 
 
 def critique_reasoning(risky_files, api_key):
@@ -373,11 +435,15 @@ def main():
     parser.add_argument("--staged", action="store_true", help="Only analyze staged changes")
     parser.add_argument("--pr", type=str, default=None, help="GitHub PR URL to analyze instead of local git diff")
     parser.add_argument("--key", type=str, default=None, help="Gemini API Key (optional, can also be prompted or use GEMINI_API_KEY env)")
+    parser.add_argument("--install-hook", action="store_true", help="Install pr-check as a git pre-push hook in the current repository")
     args = parser.parse_args()
+
+    # Handle git hook installation directly without needing API key
+    if args.install_hook:
+        install_git_hook()
 
     api_key = get_api_key(args.key)
 
-    # If no PR is given and not inside a git repo, prompt the user instead of crashing
     if not args.pr and not is_git_repo():
         print(f"{YELLOW}No active git repository detected in this directory.{RESET}")
         try:
@@ -415,6 +481,11 @@ def main():
                 f["unverified_assumption"] = assumption
 
     print_results(result)
+
+    # If risky files are found when running as a pre-push hook, exit with 1 to block push
+    if still_risky:
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
