@@ -1,62 +1,54 @@
 # pr-check
 
-A local, private pre-push code review assistant. It reads your git diff (or a GitHub PR URL), sends it to Gemini for risk analysis, and prints which changed files are actually worth a second look before you commit or push.
+A local, private pre-push code review assistant. It reads your outgoing git commits (or a public GitHub PR URL), sends diffs plus full file context to Gemini for risk analysis, and flags which files carry real risk before you push.
 
-It never touches GitHub or your PR — it only reads. That said, the diff and file contents do leave your machine over the network to reach Gemini's API. Check Google's current data retention policy for the free tier before pointing this at anything sensitive.
+**Never writes to GitHub or posts comments on PRs.** In `--pr` mode, it only reads public diffs via the GitHub API. 
 
----
-
-## Why
-
-Automated AI comments on GitHub PRs are broadly considered spam by maintainers. This tool exists to give you that feedback before you push — the one point in the loop where a human is still genuinely willing to be interrupted — instead of adding more noise to the PR itself.
-
-Every flag requires an exact quote from the added/removed lines of the diff as evidence. If the model can't point to a real line supporting its reasoning, the flag is demoted automatically — this cuts down on the model just making things up.
+Check Google's current data retention policy for the free tier before pointing this at anything sensitive.
 
 ---
 
-## Installation
+## Quickstart (Try it in 2 minutes)
 
 ### Windows (No Python required)
-1. Download `pr-check-windows-x64.zip` from the latest [Releases](https://github.com/Spacexcx/pr-check/releases).
-2. Extract `pr-check.exe` anywhere you like (or drop it into your system PATH).
-3. Run it directly from PowerShell or Command Prompt:
+1. Download `pr-check-windows-x64.zip` from [Releases](https://github.com/Spacexcx/pr-check/releases) and extract `pr-check.exe`.
+2. Open terminal in any git repository and run:
    ```cmd
-   pr-check.exe --pr <url>
-Linux / macOS (or from source)
-Requirements: Python 3.8+ and git (only needed for local git diffs, not for --pr).
-No dependencies: Standard library only — no pip install required.
-Clone and run directly:
+   pr-check.exe --install-hook
+That's it! Every time you type git push, your outgoing commits are automatically verified.
+Clean code passes silently.
+High-confidence verified risks intercept the push.
+Bypass anytime with: git push --no-verify
+(Linux / macOS users can run python3 pr_check.py --install-hook with zero dependencies).
+Why
+Automated AI bot comments on GitHub PRs are broadly considered spam by maintainers. This tool exists to give you private feedback before you push — the one point in the loop where a human is still genuinely willing to be interrupted — instead of adding noise to public PR threads.
+Every flag requires an exact quote from the added/removed lines of the diff as evidence. If the model can't point to a real line supporting its reasoning, the flag is demoted automatically.
+Installation & Setup
+Standalone Executable (Windows)
+Download pr-check-windows-x64.zip from Releases, extract pr-check.exe, and drop it anywhere in your PATH.
+From Source (Linux / macOS / Windows)
+Requirements: Python 3.8+ and git.
+Standard library only — no pip install required:
 code
 Bash
 git clone https://github.com/Spacexcx/pr-check.git
 cd pr-check
 python3 pr_check.py --help
-Setup (Gemini API Key)
-Get a free Gemini API key (no credit card required) at aistudio.google.com → Get API key → Create API key.
-You have three ways to provide it:
-Interactive (simplest): Just run the tool. If no key is detected, it will prompt you once and save it locally to ~/.pr_check_key so you don't have to enter it again.
-Command line argument: Pass --key "AIza..." directly.
-Environment variable:
-Windows (PowerShell): $env:GEMINI_API_KEY="AIza..."
-Windows (CMD): set GEMINI_API_KEY=AIza...
-macOS / Linux: export GEMINI_API_KEY="AIza..."
+API Key (Free, No Credit Card)
+Get a free Gemini API key at aistudio.google.com.
+Interactive: Run the tool once; it will prompt and save locally to ~/.pr_check_key.
+Command Line: Pass --key "AIza...".
+Environment: export GEMINI_API_KEY="AIza..." or $env:GEMINI_API_KEY="AIza...".
 Usage
-Using the standalone executable (Windows):
 code
-Cmd
-pr-check.exe                       # analyze unstaged + staged local git changes
+Bash
+# Automated Git Hook (Recommended)
+pr-check.exe --install-hook
+
+# Manual Checks
+pr-check.exe                       # analyze unstaged + staged local changes
 pr-check.exe --staged              # only staged changes
 pr-check.exe --pr <url>            # analyze a public GitHub PR without cloning
-Using Python (Linux / macOS / Source):
-code
-Bash
-python pr_check.py                 # analyze unstaged + staged local git changes
-python pr_check.py --staged        # only staged changes
-python pr_check.py --pr <url>      # analyze a public GitHub PR without cloning
-Example:
-code
-Bash
-pr-check.exe --pr https://github.com/godotengine/godot/pull/84241
 Example Output
 When a change is safe:
 code
@@ -73,17 +65,11 @@ Text
    ↳ "callable_mp(this, &GDScriptTextDocument::reload_script).call_deferred(scr);"
 
 1 file(s) worth a second look before you push.
-Known Limitations
-Early-stage testing: Tested across real merged PRs from Godot (C++), React (JS), PyTorch (Python), OpenTelemetry (Go), and Apache RocketMQ (Java). Treat it as an early-stage tool, not an infallible auditor.
-Verified evidence vs. unverified reasoning: The tool programmatically asserts that every quoted line genuinely comes from the added/removed lines in the diff (not fabricated or pulled from unchanged context). However, a genuine quote doesn't guarantee a sound conclusion. In one test, it correctly quoted a line but inferred a deadlock by assuming a mutex was non-recursive when it was actually recursive. A second critique pass specifically asks the model to isolate unverified behavioral assumptions:
-code
-Text
-⚠ Assumes: the Mutex type used here is non-recursive — verify before trusting this flag
-Context budget on large PRs: Diff lines are always sent in full. Extra full-file context is capped by a total budget (300,000 chars). Files exceeding the budget fall back to diff-only with a visible warning rather than silently truncating or breaking the API call.
-Packaging: Standalone binary is currently provided for Windows x64. macOS and Linux run via pr_check.py without package installation.
-How It Works
-Context building: Collects the git diff plus full current file contents for context (e.g., catching changes that invert logic documented in an earlier docstring).
-Analysis pass: Evaluates risk via gemini-3.6-flash, tuned with strict negative rules against keyword bias (e.g., refactors simply touching "crypto" or "auth" paths are not flagged unless a concrete behavioral diff is shown).
-Deterministic grounding: Programmatically checks that every reported evidence_quote matches a changed diff line verbatim. Any flag failing this is demoted immediately.
-Adversarial critique pass: For remaining flagged files, runs a second pass isolating unverified framework/type assumptions and surfaces them explicitly.
-Resilience: Retries transient API errors (429, 500, 503) with exponential backoff (1s, 2s, 4s).
+How It Works (Epistemic Risk Gate)
+Exact Outgoing Diffs: In hook mode, reads Git's stdin ref stream (<remote_sha>..<local_sha>) to inspect the exact commits being pushed. Reads file contents directly from the pushed commit SHA via git show, preventing uncommitted working-tree edits from contaminating the context.
+Context Building: Combines the diff with full file contents (capped at 300,000 characters) to catch contradictions between modified logic and docstrings/signatures above or below the diff hunk.
+Evidence Grounding: Programmatically checks that every reported evidence_quote matches a changed diff line verbatim. Any flag failing this is demoted immediately.
+Adversarial Critique Pass: For remaining flagged files, a second pass isolates unverified assumptions about outside libraries/types (e.g. assuming a mutex type is non-recursive).
+If an unverified outside assumption is detected, the risk is demoted to medium (warns the user without blocking git push).
+Only high-confidence, fully self-contained risks block the push.
+Graceful Fail-Open: If the Gemini API experiences downtime (503), rate limits, or network drops, pr-check prints a warning but allows the push to proceed. You are never trapped by third-party downtime.
