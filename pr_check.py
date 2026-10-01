@@ -1473,11 +1473,7 @@ def main():
     # API key
     # ---------------------------------------------------------------
 
-       api_key = get_api_key(
-        args.key,
-        hook_mode=args.hook_mode,
-    )
-
+    api_key = get_api_key(args.key, hook_mode=args.hook_mode)
     if not api_key:
         sys.exit(0)
 
