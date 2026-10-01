@@ -145,7 +145,10 @@ def get_api_key(cli_key=None, hook_mode=False):
     print(f"Get a free key at {BOLD}https://aistudio.google.com{RESET}")
 
     try:
-        entered = input("Paste your Gemini API Key here (press Enter to cancel): ").strip()
+        entered = input(
+            "Paste your Gemini API Key here "
+            "(press Enter to cancel): "
+        ).strip()
     except (KeyboardInterrupt, EOFError):
         print()
         sys.exit(0)
