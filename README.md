@@ -1,5 +1,7 @@
 # pr-check
 
+Unlike generic LLM wrappers, pr-check enforces a strict programmatic evidence-grounding layer (every risk flag requires an exact diff quote verified in code) followed by an adversarial second pass that isolates unverified external type assumptions. Runs 100% locally via git pre-push hook.
+
 A local, private pre-push code review assistant. It reads your outgoing git commits (or a public GitHub PR URL), sends diffs plus full file context to Gemini for risk analysis, and flags which files carry real risk before you push.
 
 **Never writes to GitHub or posts comments on PRs.** In `--pr` mode, it only reads public diffs via the GitHub API. 
