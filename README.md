@@ -1,5 +1,8 @@
 # pr-check
 
+- **Field-tested on real open PRs:** Caught a `difflib` line-mapping opcode bug in `rigour-labs/driftbench` ([fixed and merged in PR #26](https://github.com/rigour-labs/driftbench/pull/26) with attribution).
+
+
 Unlike generic LLM wrappers, pr-check enforces a strict programmatic evidence-grounding layer (every risk flag requires an exact diff quote verified in code) followed by an adversarial second pass that isolates unverified external type assumptions. Runs 100% locally via git pre-push hook.
 
 A local, private pre-push code review assistant. It reads your outgoing git commits (or a public GitHub PR URL), sends diffs plus full file context to Gemini for risk analysis, and flags which files carry real risk before you push.
