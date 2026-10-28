@@ -1,7 +1,7 @@
 # pr-check
 
 - **Field-tested on real open PRs:** Caught a `difflib` line-mapping opcode bug in `rigour-labs/driftbench` ([fixed and merged in PR #26](https://github.com/rigour-labs/driftbench/pull/26) with attribution).
-
+> **Windows Note:** The `.exe` is an unsigned open-source binary, so Windows SmartScreen will show a warning on first run (*"More info" → "Run anyway"*). Setup takes ~1 minute (+2-3 minutes if you need to create a free Gemini API key).
 
 Unlike generic LLM wrappers, pr-check enforces a strict programmatic evidence-grounding layer (every risk flag requires an exact diff quote verified in code) followed by an adversarial second pass that isolates unverified external type assumptions. Runs 100% locally via git pre-push hook.
 
