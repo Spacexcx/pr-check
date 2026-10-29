@@ -45,7 +45,7 @@ MAX_FULL_FILE_SIZE = 40_000
 
 KEY_FILE = Path.home() / ".pr_check_key"
 
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-3.5-flash-lite"
 
 
 # ---------------------------------------------------------------------------
