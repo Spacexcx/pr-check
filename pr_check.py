@@ -27,6 +27,12 @@ from pathlib import Path
 
 if sys.platform == "win32":
     os.system("")
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 RED = "\033[91m"
 YELLOW = "\033[93m"
@@ -207,10 +213,15 @@ def install_git_hook():
         )
         sys.exit(1)
 
-    hooks_dir = root / ".git" / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
+    # 1. Husky veya özel hook klasörü kontrolü (git config core.hooksPath)
+    result = run_git(["config", "--get", "core.hooksPath"])
+    if result and result.returncode == 0 and result.stdout.strip():
+        hooks_dir = Path(root) / result.stdout.strip()
+    else:
+        hooks_dir = Path(root) / ".git" / "hooks"
 
-    hook_path = hooks_dir / "pre-push"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook_file = hooks_dir / "pre-push"
 
     if getattr(sys, "frozen", False):
         exec_target = f'"{Path(sys.executable).resolve()}"'
@@ -219,6 +230,16 @@ def install_git_hook():
             f'"{sys.executable}" '
             f'"{Path(__file__).resolve()}"'
         )
+
+    # 2. Seçenek (b): Eğer kullanıcıda zaten başka bir hook varsa EZME, uyar ve satırı ver!
+    if hook_file.exists():
+        existing_content = hook_file.read_text(encoding="utf-8", errors="ignore")
+        if "pr-check" not in existing_content:
+            print(f"{YELLOW}[pr-check] Existing pre-push hook detected at: {hook_file}{RESET}")
+            print(f"To protect your existing tests/workflow, pr-check will NOT overwrite it.\n")
+            print(f"To integrate pr-check, simply add this line to your hook file:")
+            print(f"  {BOLD}{exec_target} --hook-mode{RESET}\n")
+            sys.exit(0)
 
     hook_script = f"""#!/bin/sh
 # pr-check automated pre-push gate
@@ -244,22 +265,14 @@ exit 0
 """
 
     try:
-        # Eğer önceden var olan başka bir hook varsa üzerine yazıp silme, yedekle!
-        if hook_path.exists():
-            existing_content = hook_path.read_text(encoding="utf-8", errors="ignore")
-            if "pr-check" not in existing_content:
-                backup_path = hook_path.with_name("pre-push.pr-check.backup")
-                hook_path.rename(backup_path)
-                print(f"{YELLOW}[pr-check] Existing pre-push hook backed up to: {backup_path}{RESET}")
-
-        hook_path.write_text(
+        hook_file.write_text(
             hook_script,
             encoding="utf-8",
             newline="\n",
         )
 
         if sys.platform != "win32":
-            hook_path.chmod(0o755)
+            hook_file.chmod(0o755)
 
         print(
             f"{GREEN}{BOLD}"
@@ -268,7 +281,7 @@ exit 0
         )
 
         print(
-            f"{DIM}Installed to: {hook_path}{RESET}\n"
+            f"{DIM}Installed to: {hook_file}{RESET}\n"
         )
 
         print(f"{BOLD}How it works:{RESET}")
