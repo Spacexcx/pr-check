@@ -210,7 +210,7 @@ def install_git_hook():
     hooks_dir = root / ".git" / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
 
-    hook_file = hooks_dir / "pre-push"
+    hook_path = hooks_dir / "pre-push"
 
     if getattr(sys, "frozen", False):
         exec_target = f'"{Path(sys.executable).resolve()}"'
@@ -244,14 +244,22 @@ exit 0
 """
 
     try:
-        hook_file.write_text(
+        # Eğer önceden var olan başka bir hook varsa üzerine yazıp silme, yedekle!
+        if hook_path.exists():
+            existing_content = hook_path.read_text(encoding="utf-8", errors="ignore")
+            if "pr-check" not in existing_content:
+                backup_path = hook_path.with_name("pre-push.pr-check.backup")
+                hook_path.rename(backup_path)
+                print(f"{YELLOW}[pr-check] Existing pre-push hook backed up to: {backup_path}{RESET}")
+
+        hook_path.write_text(
             hook_script,
             encoding="utf-8",
             newline="\n",
         )
 
         if sys.platform != "win32":
-            hook_file.chmod(0o755)
+            hook_path.chmod(0o755)
 
         print(
             f"{GREEN}{BOLD}"
@@ -260,7 +268,7 @@ exit 0
         )
 
         print(
-            f"{DIM}Installed to: {hook_file}{RESET}\n"
+            f"{DIM}Installed to: {hook_path}{RESET}\n"
         )
 
         print(f"{BOLD}How it works:{RESET}")
@@ -1488,22 +1496,12 @@ def main():
         not args.pr
         and not is_git_repo()
     ):
-        print(
-            f"{YELLOW}"
-            f"No active git repository detected in this directory."
-            f"{RESET}"
-        )
+        print(f"{YELLOW}[pr-check] No active git repository detected in this directory.{RESET}")
+        print(f"{DIM}Paste a GitHub PR URL to analyze, or press [Enter] to exit back to shell.{RESET}")
 
         try:
-            entered_pr = input(
-                "Enter a GitHub PR URL to analyze "
-                "(or press Enter to exit): "
-            ).strip()
-
-        except (
-            KeyboardInterrupt,
-            EOFError,
-        ):
+            entered_pr = input("URL: ").strip()
+        except (KeyboardInterrupt, EOFError):
             print()
             sys.exit(0)
 
